@@ -80,7 +80,6 @@ class SVMModel private[svm](val selfKey: Key[_ <: Keyed[_ <: Keyed[_ <: AnyRef]]
     if(_parms._threshold.isNaN) { // Regression
       preds(0) = pred
     } else { // Binomial
-      // TODO not 100% sure what should be returned here for the ROC curve to work in FlowUI
       if(pred > _parms._threshold) {
         preds(2) = 1
         preds(1) = 0

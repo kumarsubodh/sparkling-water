@@ -16,11 +16,14 @@
  */
 package org.apache.spark.ml.spark.models.svm;
 
-import hex.ModelBuilder;
-import hex.ModelCategory;
-import hex.ModelMetrics;
-import org.apache.spark.SparkContext;
+import hex.*;
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics;
+import org.apache.spark.mllib.evaluation.RegressionMetrics;
+import scala.Tuple2;
+
 import org.apache.spark.api.java.function.Function;
+import org.apache.spark.SparkContext;
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.h2o.H2OContext;
 import org.apache.spark.ml.spark.models.svm.SVMModel.SVMOutput;
 import org.apache.spark.ml.spark.models.svm.SVMModel.SVMParameters;
@@ -31,6 +34,7 @@ import org.apache.spark.mllib.regression.LabeledPoint;
 import org.apache.spark.rdd.RDD;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
+import org.apache.spark.sql.types.StructField;
 import water.Scope;
 import water.fvec.Frame;
 import water.fvec.H2OFrame;
@@ -39,12 +43,6 @@ import water.util.Log;
 
 import java.util.Arrays;
 
-/**
- * Had to rewrite this is Java because we need 2 completely different constructors:
- * - one with a boolean for FlowUI
- * - one with parameters to use in Scala/Java code
- * and there was no way to go around it in Scala.
- * */
 public class SVM extends ModelBuilder<SVMModel, SVMParameters, SVMOutput> {
 
     public SVM(boolean startup_once) {
@@ -90,14 +88,36 @@ public class SVM extends ModelBuilder<SVMModel, SVMParameters, SVMOutput> {
             }
         }
 
-        if ((null == _parms.train().domains()[_parms.train().find(_parms._response_column)]) &&
-                !(Double.isNaN(_parms._threshold()))) {
-            error("_threshold", "Threshold cannot be set for regression SVM.");
-        } else if (
-                (null != _parms.train().domains()[_parms.train().find(_parms._response_column)]) &&
-                        Double.isNaN(_parms._threshold())) {
-            error("_threshold", "Threshold has to be set for binomial SVM.");
+        if(_train.hasNAs()) {
+            error("_train", "Training frame cannot contain any missing values.");
         }
+
+        for(Vec vec : _train.vecs()) {
+            if( !(vec.isNumeric() || vec.isTime() || vec.isCategorical()) ) {
+                error("_train", "SVM supports only frames with numeric values. But a " + vec.get_type_str() + " was found.");
+            }
+        }
+
+        if(null == _parms._response_column) {
+            error("_response_column", "Response column has to be set.");
+        }
+
+        if(null == _train.vec(_parms._response_column)) {
+            error("_train", "Training frame has to contain the response column.");
+        }
+
+
+        if (null == responseDomains()
+            && !(Double.isNaN(_parms._threshold()))) {
+            error("_threshold", "Threshold cannot be set for regression SVM. Set the threshold to NaN or modify the response column to an enum.");
+        } else if (null != responseDomains()
+                   && Double.isNaN(_parms._threshold())) {
+            error("_threshold", "Threshold has to be set for binomial SVM. Set the threshold to a numeric value or change the response column type.");
+        }
+    }
+
+    private String[] responseDomains() {
+        return _parms.train().domains()[_parms.train().find(_parms._response_column)];
     }
 
     @Override
@@ -144,14 +164,7 @@ public class SVM extends ModelBuilder<SVMModel, SVMParameters, SVMOutput> {
                 svm.optimizer().setGradient(_parms._gradient().get());
                 svm.optimizer().setUpdater(_parms._updater().get());
 
-                /**
-                 * TODO should we try and implement job cancellation?
-                 * One idea would be to run the below code in a different thread
-                 * get the spark JOB and try to cancel it when the user presses cancel.
-                 * The problem is we won't get any model then, we cannot take intermediate
-                 * results like in our own impls.
-                 */
-                org.apache.spark.mllib.classification.SVMModel trainedModel =
+                final org.apache.spark.mllib.classification.SVMModel trainedModel =
                         (null == _parms._initial_weights()) ?
                                 svm.run(training) :
                                 svm.run(training, vec2vec(_parms.initialWeights().vecs()));
@@ -159,8 +172,10 @@ public class SVM extends ModelBuilder<SVMModel, SVMParameters, SVMOutput> {
 
                 model._output.weights_$eq(trainedModel.weights().toArray());
                 model._output.interceptor_$eq(trainedModel.intercept());
+
+                SVMDriverUtil.addModelMetrics(model, training, trainedModel, _parms.train(), responseDomains());
                 model.update(_job);
-                // TODO how to update from Spark hmmm?
+
                 _job.update(model._parms._max_iterations());
 
                 if (_valid != null) {
@@ -188,7 +203,6 @@ public class SVM extends ModelBuilder<SVMModel, SVMParameters, SVMOutput> {
 
         private RDD<LabeledPoint> getTrainingData(Frame parms, String _response_column, int nfeatures) {
             String[] domains = parms.domains()[parms.find(_response_column)];
-
             return h2oContext.createH2OSchemaRDD(new H2OFrame(parms), sqlContext)
                     .javaRDD()
                     .map(new RowToLabeledPoint(nfeatures, _response_column, domains)).rdd();
@@ -209,9 +223,10 @@ class RowToLabeledPoint implements Function<Row, LabeledPoint> {
 
     @Override
     public LabeledPoint call(Row row) throws Exception {
+        StructField[] fields = row.schema().fields();
         double[] features = new double[nfeatures];
         for (int i = 0; i < nfeatures; i++) {
-            // TODO more performant way to handle this??
+            fields[i].dataType().typeName();
             features[i] = Double.parseDouble(row.get(i).toString());
         }
 
@@ -220,7 +235,6 @@ class RowToLabeledPoint implements Function<Row, LabeledPoint> {
                 Vectors.dense(features));
     }
 
-    // TODO more performant way to handle this??
     private double toDoubleLabel(Object label) {
         if(label instanceof String) return Arrays.binarySearch(domains, label);
         if(label instanceof Byte) return ((Byte)label).doubleValue();
@@ -228,4 +242,62 @@ class RowToLabeledPoint implements Function<Row, LabeledPoint> {
         if(label instanceof Double) return (Double) label;
         throw new IllegalArgumentException("Target column has to be an enum or a number.");
     }
+}
+
+class SVMDriverUtil {
+
+    public static void addModelMetrics(SVMModel model, RDD<LabeledPoint> training,
+                                 final org.apache.spark.mllib.classification.SVMModel trainedModel,
+                                 Frame f,
+                                 String[] responseDomains) {
+
+        JavaRDD<Tuple2<Object, Object>> predictionAndLabels = training.toJavaRDD().map(
+                new Function<LabeledPoint, Tuple2<Object, Object>>() {
+                    public Tuple2<Object, Object> call(LabeledPoint p) {
+                        Double prediction = trainedModel.predict(p.features());
+                        return new Tuple2<>(prediction, p.label());
+                    }
+                }
+        );
+
+        BinaryClassificationMetrics metrics = new BinaryClassificationMetrics(predictionAndLabels.rdd());
+        double areaUnderPR = metrics.areaUnderPR();
+
+        RegressionMetrics regressionMetrics = new RegressionMetrics(predictionAndLabels.rdd());
+        final double mse = regressionMetrics.meanSquaredError();
+
+        switch (model._output.getModelCategory()) {
+            case Binomial:
+                model._output.addModelMetrics(
+                        new ModelMetricsBinomial(
+                                model,
+                                f,
+                                mse,
+                                responseDomains,
+                                0,
+                                null,
+                                0,
+                                null
+                        ) {
+                            @Override
+                            public double auc() {
+                                return areaUnderPR;
+                            }
+                        }
+                );
+                break;
+            default:
+                model._output.addModelMetrics(
+                        new ModelMetricsRegression(
+                                model,
+                                f,
+                                mse,
+                                0,
+                                0
+                        )
+                );
+                break;
+        }
+    }
+
 }
