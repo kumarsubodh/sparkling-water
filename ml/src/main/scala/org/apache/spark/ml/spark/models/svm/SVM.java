@@ -17,13 +17,9 @@
 package org.apache.spark.ml.spark.models.svm;
 
 import hex.*;
-import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics;
-import org.apache.spark.mllib.evaluation.RegressionMetrics;
-import scala.Tuple2;
 
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.SparkContext;
-import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.h2o.H2OContext;
 import org.apache.spark.ml.spark.models.svm.SVMModel.SVMOutput;
 import org.apache.spark.ml.spark.models.svm.SVMModel.SVMParameters;
@@ -244,60 +240,3 @@ class RowToLabeledPoint implements Function<Row, LabeledPoint> {
     }
 }
 
-class SVMDriverUtil {
-
-    public static void addModelMetrics(SVMModel model, RDD<LabeledPoint> training,
-                                 final org.apache.spark.mllib.classification.SVMModel trainedModel,
-                                 Frame f,
-                                 String[] responseDomains) {
-
-        JavaRDD<Tuple2<Object, Object>> predictionAndLabels = training.toJavaRDD().map(
-                new Function<LabeledPoint, Tuple2<Object, Object>>() {
-                    public Tuple2<Object, Object> call(LabeledPoint p) {
-                        Double prediction = trainedModel.predict(p.features());
-                        return new Tuple2<>(prediction, p.label());
-                    }
-                }
-        );
-
-        BinaryClassificationMetrics metrics = new BinaryClassificationMetrics(predictionAndLabels.rdd());
-        double areaUnderPR = metrics.areaUnderPR();
-
-        RegressionMetrics regressionMetrics = new RegressionMetrics(predictionAndLabels.rdd());
-        final double mse = regressionMetrics.meanSquaredError();
-
-        switch (model._output.getModelCategory()) {
-            case Binomial:
-                model._output.addModelMetrics(
-                        new ModelMetricsBinomial(
-                                model,
-                                f,
-                                mse,
-                                responseDomains,
-                                0,
-                                null,
-                                0,
-                                null
-                        ) {
-                            @Override
-                            public double auc() {
-                                return areaUnderPR;
-                            }
-                        }
-                );
-                break;
-            default:
-                model._output.addModelMetrics(
-                        new ModelMetricsRegression(
-                                model,
-                                f,
-                                mse,
-                                0,
-                                0
-                        )
-                );
-                break;
-        }
-    }
-
-}
